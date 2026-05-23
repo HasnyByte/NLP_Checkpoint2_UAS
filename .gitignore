@@ -1,0 +1,32 @@
+# environment
+.env
+venv/
+.venv/
+
+# python
+__pycache__/
+*.pyc
+
+# logs
+log/
+*.log
+
+# runtime artifacts
+storage/app/whisper.cpp/
+
+# whisper
+app/whisper.cpp/
+
+# storage
+storage/chat_history.json
+storage/rate_state.json
+
+# Audio saja di dalam data
+data/audio/
+
+# Storage dan semua isinya
+storage/**
+
+.github/app/coqui_utils/*.pth
+app/coqui_utils/checkpoint_*.pth
+app/coqui_utils/*.pth
