@@ -24,7 +24,7 @@ voice_chatbot_project/
 │
 │
 ├── data/
-│   └── audio/
+│   └── audio/             # Semua file audio
 │
 ├── gradio_app/
 │   └── app.py             # Frontend dengan Gradio
