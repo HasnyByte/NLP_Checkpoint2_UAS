@@ -22,6 +22,10 @@ voice_chatbot_project/
 │   └── whisper.cpp/       # Hasil clone whisper.cpp
 │   └── coqui_utils/       # Model dan config Coqui TTS
 │
+│
+├── data/
+│   └── audio/
+│
 ├── gradio_app/
 │   └── app.py             # Frontend dengan Gradio
 │
