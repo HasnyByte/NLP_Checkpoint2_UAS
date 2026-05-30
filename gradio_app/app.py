@@ -1,11 +1,11 @@
 import base64
+import importlib
 import json
 import os
 import sys
 import tempfile
 import time
 import uuid
-from pathlib import Path
 
 import gradio as gr
 import pandas as pd
@@ -17,10 +17,18 @@ import scipy.io.wavfile
 # Config
 # ---------------------------------------------------------------------------
 BACKEND_URL = os.getenv("FASTAPI_URL", "http://localhost:8000/voice-chat")
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-AUDIO_DATA_DIR = PROJECT_ROOT / "data" / "audio"
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, os.pardir))
+BACKEND_APP_DIR = os.path.join(PROJECT_ROOT, "app")
+AUDIO_DATA_DIR = os.path.join(PROJECT_ROOT, "data", "audio")
+
+# Put backend paths before gradio_app so batch imports resolve to PROJECT_ROOT/app,
+# not this UI file (`gradio_app/app.py`) when the Gradio app is run as a script.
+for path in (PROJECT_ROOT, BACKEND_APP_DIR):
+    if path in sys.path:
+        sys.path.remove(path)
+sys.path.insert(0, PROJECT_ROOT)
+sys.path.insert(0, BACKEND_APP_DIR)
 
 BATCH_LIMIT_CHOICES = [10, 50, 100, 250, 500]
 BATCH_TABLE_HEADERS = [
@@ -127,16 +135,44 @@ def _empty_batch_result(message, state="idle"):
     )
 
 
+def _import_backend_pipeline_functions():
+    loaded_app = sys.modules.get("app")
+    loaded_app_file = os.path.abspath(getattr(loaded_app, "__file__", "") or "")
+    current_file = os.path.abspath(__file__)
+
+    if loaded_app is not None and (loaded_app_file == current_file or not hasattr(loaded_app, "__path__")):
+        print(f"[Batch Pipeline] Menghapus modul app yang salah: {loaded_app_file or loaded_app}")
+        sys.modules.pop("app", None)
+
+    for path in (PROJECT_ROOT, BACKEND_APP_DIR):
+        if path in sys.path:
+            sys.path.remove(path)
+    sys.path.insert(0, PROJECT_ROOT)
+    sys.path.insert(0, BACKEND_APP_DIR)
+
+    llm_module = importlib.import_module("llm")
+    stt_module = importlib.import_module("stt")
+    utils_module = importlib.import_module("utils")
+    return (
+        llm_module.generate_response,
+        stt_module.transcribe_audio_file,
+        utils_module.normalize_transcript_text,
+    )
+
+
 def _list_audio_files(audio_dir=AUDIO_DATA_DIR):
-    if not audio_dir.exists():
+    print(f"[Batch Pipeline] Folder audio digunakan: {audio_dir}")
+
+    if not os.path.isdir(audio_dir):
         return []
 
     files = [
-        path
-        for path in audio_dir.iterdir()
-        if path.is_file() and path.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS
+        os.path.join(audio_dir, filename)
+        for filename in os.listdir(audio_dir)
+        if os.path.isfile(os.path.join(audio_dir, filename))
+        and os.path.splitext(filename)[1].lower() in SUPPORTED_AUDIO_EXTENSIONS
     ]
-    return sorted(files, key=lambda path: path.name.lower())
+    return sorted(files, key=lambda path: os.path.basename(path).lower())
 
 
 def _truncate_text(text, max_chars=260):
@@ -156,6 +192,9 @@ def _clean_error_message(message):
     if not raw_message:
         return "Error tidak diketahui"
 
+    if "'Button' object has no attribute '_id'" in raw_message:
+        return "Konfigurasi batch salah - komponen UI terbaca sebagai data"
+
     if "Teks kosong" in raw_message or "teks kosong" in raw_message:
         return "TTS gagal - teks kosong"
 
@@ -169,8 +208,10 @@ def _clean_error_message(message):
         pass
 
     lowered = raw_message.lower()
+    if "file" in lowered and "tidak ditemukan" in lowered:
+        return "File audio tidak ditemukan"
     if "whisper timeout" in lowered:
-        return "STT timeout"
+        return "STT gagal"
     if "whisper" in lowered:
         return "STT gagal"
     if "gemini" in lowered or "llm" in lowered:
@@ -185,46 +226,63 @@ def _clean_error_message(message):
 
 def _process_audio_file_for_batch(file_path, mode):
     start_time = time.time()
+    file_name = os.path.basename(str(file_path))
 
     try:
-        from app.llm import generate_response
-        from app.stt import transcribe_audio_file
-        from app.utils import normalize_text
+        if not os.path.isfile(file_path):
+            print(f"[Batch Pipeline] File tidak ditemukan: {file_path}")
+            return "", "", "File audio tidak ditemukan", round(time.time() - start_time, 2)
 
-        stt_text = transcribe_audio_file(str(file_path))
+        print(f"[Batch Pipeline] Memproses file: {file_name}")
+        generate_response, transcribe_audio_file, normalize_transcript_text = _import_backend_pipeline_functions()
+
+        stt_text = transcribe_audio_file(file_path)
         latency = round(time.time() - start_time, 2)
+        print(f"[Batch Pipeline] STT {file_name}: {_truncate_text(stt_text, 120) or '<kosong>'}")
 
         if _is_blank_or_error(stt_text):
             status = (
                 "STT kosong - audio tidak terbaca jelas"
                 if not str(stt_text or "").strip()
-                else _clean_error_message(stt_text)
+                else "STT gagal"
             )
+            print(f"[Batch Pipeline] Status {file_name}: {status}")
             return "", "", status, latency
 
-        prompt_text = normalize_text(stt_text) if mode == "normalized" else stt_text
-        llm_response = generate_response(prompt_text)
+        prompt_text = normalize_transcript_text(stt_text)
+        print(f"[Batch Pipeline] Prompt LLM {file_name} ({mode}): {_truncate_text(prompt_text, 180) or '<kosong>'}")
+        llm_response = generate_response(prompt_text, mode=mode)
         latency = round(time.time() - start_time, 2)
+        print(f"[Batch Pipeline] LLM {file_name}: {_truncate_text(llm_response, 120) or '<kosong>'}")
 
         if _is_blank_or_error(llm_response):
             status = (
                 "Respons LLM kosong"
                 if not str(llm_response or "").strip()
-                else _clean_error_message(llm_response)
+                else "LLM gagal"
             )
+            print(f"[Batch Pipeline] Status {file_name}: {status}")
             return stt_text, "", status, latency
 
         if "teks kosong" in str(llm_response).lower():
+            print(f"[Batch Pipeline] Status {file_name}: TTS gagal - teks kosong")
             return stt_text, "", "TTS gagal - teks kosong", latency
 
+        # Batch analysis only needs text outputs for the UI table, so TTS is skipped
+        # to avoid unnecessary audio generation and keep corpus analysis lighter.
+        print(f"[Batch Pipeline] Status {file_name}: Sukses")
         return stt_text, llm_response, "Sukses", latency
 
     except requests.exceptions.Timeout:
-        return "", "", "Error: request timeout.", round(time.time() - start_time, 2)
+        print(f"[Batch Pipeline] Error {file_name}: request timeout")
+        return "", "", "Request timeout", round(time.time() - start_time, 2)
     except requests.exceptions.ConnectionError:
-        return "", "", "Error: backend FastAPI tidak tersambung.", round(time.time() - start_time, 2)
+        print(f"[Batch Pipeline] Error {file_name}: backend tidak tersambung")
+        return "", "", "Backend tidak tersambung", round(time.time() - start_time, 2)
     except Exception as exc:
-        return "", "", _clean_error_message(exc), round(time.time() - start_time, 2)
+        status = _clean_error_message(exc)
+        print(f"[Batch Pipeline] Error {file_name}: {status} ({exc})")
+        return "", "", status, round(time.time() - start_time, 2)
 
 
 def run_batch_pipeline_analysis(limit, mode):
@@ -242,17 +300,20 @@ def run_batch_pipeline_analysis(limit, mode):
     if limit not in BATCH_LIMIT_CHOICES or limit > 500:
         return _empty_batch_result("Batas maksimal analisis adalah 500 data.", "error")
 
-    if not AUDIO_DATA_DIR.exists():
+    if not os.path.isdir(AUDIO_DATA_DIR):
+        print(f"[Batch Pipeline] Folder audio tidak ditemukan: {AUDIO_DATA_DIR}")
         return _empty_batch_result(
             f"Folder data/audio tidak ditemukan di: {AUDIO_DATA_DIR}",
             "error",
         )
 
     audio_files = _list_audio_files()
+    print(f"[Batch Pipeline] Jumlah file audio ditemukan: {len(audio_files)}")
     if not audio_files:
         return _empty_batch_result("Folder data/audio kosong atau tidak berisi file audio yang didukung.", "warning")
 
-    selected_files = audio_files[:limit]
+    selected_files = audio_files[:min(limit, 500)]
+    print(f"[Batch Pipeline] Jumlah file audio diproses: {len(selected_files)}")
     rows = []
 
     for index, file_path in enumerate(selected_files, start=1):
@@ -260,7 +321,7 @@ def run_batch_pipeline_analysis(limit, mode):
         rows.append(
             {
                 "No": index,
-                "Nama File": _truncate_text(file_path.name, 90),
+                "Nama File": _truncate_text(os.path.basename(file_path), 90),
                 "Hasil STT": _truncate_text(stt_text, 260),
                 "Respons LLM": _truncate_text(llm_response, 260),
                 "Status": _truncate_text(status, 150),
@@ -346,12 +407,16 @@ def voice_chat_pipeline(audio, mode):
 
         result = response.json()
         if result.get("status") not in {None, "success"}:
+            message = result.get("message", "Pipeline gagal diproses.")
             return (
-                None, "", "",
-                language_tags_markup("<span class='error-text'>Pipeline gagal diproses.</span>"),
-                "", "",
-                status_markup("error", result.get("message", "Pipeline gagal diproses.")),
-                result.get("message", "Pipeline gagal diproses."),
+                None,
+                result.get("user_text") or result.get("transcription") or "",
+                result.get("normalized_text") or "",
+                language_tags_markup(result.get("language_tags") or "<span class='error-text'>Pipeline gagal diproses.</span>"),
+                ratio_text(result.get("language_ratios")),
+                result.get("llm_response") or result.get("response_text") or "",
+                status_markup("error", message),
+                message,
             )
 
         session_id = result.get("session_id", uuid.uuid4().hex)
@@ -1305,6 +1370,33 @@ label span, .svelte-1f354aw { color: var(--muted) !important; }
 #audio-input button[aria-label="clear"]:hover {
   opacity: 0.95 !important;
   background: #f8fbff !important;
+}
+
+/* Keep recorded audio controls visible after microphone capture. */
+#audio-input {
+  height: auto !important;
+  min-height: 172px !important;
+  max-height: none !important;
+  overflow: visible !important;
+}
+
+#audio-input .wrap,
+#audio-input [role="tabpanel"],
+#audio-input [data-testid="audio"],
+#audio-input [data-testid="file-upload"],
+#audio-input .upload-container,
+#audio-input .dropzone,
+#audio-input .waveform-container {
+  height: auto !important;
+  max-height: none !important;
+  overflow: visible !important;
+}
+
+#audio-input [role="tabpanel"],
+#audio-input [data-testid="audio"],
+#audio-input .waveform-container {
+  min-height: 118px !important;
+  padding-bottom: 10px !important;
 }
 
 /* ── Mode radio ── */

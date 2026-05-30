@@ -11,9 +11,9 @@ from google.genai import types
 from pydantic import TypeAdapter
 
 try:
-    from .utils import normalize_text
+    from .utils import LLM_FALLBACK_RESPONSE, normalize_text
 except ImportError:
-    from utils import normalize_text
+    from utils import LLM_FALLBACK_RESPONSE, normalize_text
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(BASE_DIR)
@@ -40,12 +40,14 @@ You are a responsive, intelligent, and fluent virtual assistant.
 You answer voice-chat input from multilingual code-switching speech.
 
 Rules:
-- Default language: Indonesian.
-- Preserve useful ID-EN-AR code-switching only when it improves clarity.
+- Follow the response language instruction in the user prompt exactly.
+- If preserve mode detects mixed Indonesian/English/Arabic input, answer in Indonesian.
+- If normalized mode is requested, always answer in formal Indonesian.
 - Keep answers polite, clear, and short, maximum 2-3 sentences.
 - Do not repeat the user's question.
 - If the input is unclear, ask one short clarification question.
 - If you do not know the answer, say honestly that you do not know.
+- Avoid markdown, bullets, URLs, and symbols that are hard for TTS to read.
 """.strip()
 
 client = genai.Client(api_key=GOOGLE_API_KEY)
@@ -137,18 +139,96 @@ def load_chat_history():
 chat = load_chat_history()
 
 
-def generate_response(prompt: str) -> str:
+def _detect_prompt_language(text: str) -> str:
+    text = normalize_text(text).lower()
+    if not text:
+        return "id"
+
+    tokens = re.findall(r"[A-Za-z]+|[ء-ي]+", text)
+    if not tokens:
+        return "id"
+
+    ind_words = {
+        "aku", "saya", "kamu", "anda", "kita", "mereka", "mau", "ingin", "boleh",
+        "bisa", "tolong", "bantu", "mohon", "apa", "siapa", "kapan", "bagaimana",
+        "dimana", "kemana", "berapa", "dan", "atau", "yang", "untuk", "dengan",
+        "tidak", "belum", "sudah", "coba", "jelaskan", "buatkan", "kasih", "beri",
+        "gue", "lu", "lo", "gimana", "nggak", "gak", "nih", "dong", "deh", "sih",
+    }
+    en_words = {
+        "i", "you", "we", "they", "he", "she", "it", "am", "is", "are", "was", "were",
+        "can", "could", "would", "should", "will", "please", "help", "explain", "what",
+        "who", "when", "where", "why", "how", "the", "a", "an", "to", "for", "from",
+        "with", "about", "make", "give", "tell", "thanks", "hello", "hi", "okay", "ok",
+    }
+    ar_latin_words = {
+        "assalamualaikum", "salamualaikum", "waalaikumsalam", "alhamdulillah",
+        "inshaallah", "insyaallah", "masyaallah", "subhanallah", "habibi",
+        "habibti", "wallahi", "jazakallah", "allah",
+    }
+
+    counts = {"id": 0, "en": 0, "ar": 0}
+    for token in tokens:
+        lowered = token.lower()
+        if re.fullmatch(r"[ء-ي]+", token) or lowered in ar_latin_words:
+            counts["ar"] += 1
+        elif lowered in en_words or lowered.endswith(("ing", "tion", "ment", "ly", "ize", "ise")):
+            counts["en"] += 1
+        elif lowered in ind_words or lowered.endswith(("nya", "lah", "kah", "pun", "ku", "mu")):
+            counts["id"] += 1
+        else:
+            counts["id"] += 1
+
+    active = [lang for lang, count in counts.items() if count > 0]
+    total = sum(counts.values()) or 1
+    dominant_lang, dominant_count = max(counts.items(), key=lambda item: item[1])
+
+    if len(active) > 1 and dominant_count / total < 0.78:
+        return "mixed"
+    return dominant_lang
+
+
+def _build_mode_prompt(prompt: str, mode: str) -> str:
+    mode = mode if mode in {"preserve", "normalized"} else "preserve"
+    prompt = normalize_text(prompt)
+
+    if mode == "normalized":
+        language_instruction = (
+            "Jawab selalu dalam Bahasa Indonesia formal, apa pun bahasa input pengguna."
+        )
+    else:
+        language = _detect_prompt_language(prompt)
+        if language == "en":
+            language_instruction = "Answer only in natural English."
+        elif language == "ar":
+            language_instruction = "أجب باللغة العربية فقط وبأسلوب واضح ومختصر."
+        else:
+            language_instruction = (
+                "Jawab dalam Bahasa Indonesia. Jika input pengguna campuran bahasa, tetap jawab dalam Bahasa Indonesia."
+            )
+
+    return (
+        f"Mode respons: {mode}.\n"
+        f"Instruksi bahasa: {language_instruction}\n"
+        "Instruksi gaya: respons singkat, natural, jelas, maksimal 2-3 kalimat, cocok dibaca TTS, tanpa markdown.\n"
+        f"Teks pengguna: {prompt}"
+    )
+
+
+def generate_response(prompt: str, mode: str = "preserve") -> str:
     normalized_prompt = normalize_text(prompt)
     if not normalized_prompt:
-        return "Maaf, saya belum menerima teks yang jelas dari audio."
+        return LLM_FALLBACK_RESPONSE
 
+    mode_prompt = _build_mode_prompt(normalized_prompt, mode)
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             _wait_for_rate_limit()
-            response = chat.send_message(normalized_prompt)
+            response = chat.send_message(mode_prompt)
             save_chat_history(chat)
-            return normalize_text(response.text or "")
+            llm_text = normalize_text(response.text or "")
+            return llm_text or LLM_FALLBACK_RESPONSE
         except Exception as exc:
             last_error = exc
             delay = _extract_retry_delay_seconds(exc)

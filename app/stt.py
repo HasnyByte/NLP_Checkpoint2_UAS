@@ -5,9 +5,9 @@ import uuid
 from pathlib import Path
 
 try:
-    from .utils import TEMP_DIR, normalize_text, safe_delete
+    from .utils import TEMP_DIR, normalize_transcript_text, safe_delete
 except ImportError:
-    from utils import TEMP_DIR, normalize_text, safe_delete
+    from utils import TEMP_DIR, normalize_transcript_text, safe_delete
 
 try:
     from processing import preprocess_audio
@@ -101,7 +101,7 @@ def transcribe_audio_file(audio_path: str) -> str:
 
         try:
             with open(output_txt, "r", encoding="utf-8") as file:
-                return normalize_text(file.read())
+                return normalize_transcript_text(file.read())
         except FileNotFoundError:
             return "[ERROR] File hasil transkripsi tidak ditemukan."
     finally:

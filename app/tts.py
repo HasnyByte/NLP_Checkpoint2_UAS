@@ -4,9 +4,9 @@ import sys
 import uuid
 
 try:
-    from .utils import TEMP_DIR, normalize_text
+    from .utils import LLM_FALLBACK_RESPONSE, TEMP_DIR, prepare_text_for_tts
 except ImportError:
-    from utils import TEMP_DIR, normalize_text
+    from utils import LLM_FALLBACK_RESPONSE, TEMP_DIR, prepare_text_for_tts
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _env_coqui = os.getenv("COQUI_DIR")
@@ -37,9 +37,9 @@ def _validate_coqui_paths() -> None:
 
 
 def transcribe_text_to_speech(text: str) -> str:
-    text = normalize_text(text)
+    text = prepare_text_for_tts(text, fallback=LLM_FALLBACK_RESPONSE)
     if not text:
-        raise ValueError("Teks kosong, tidak bisa dibuat menjadi audio.")
+        text = LLM_FALLBACK_RESPONSE
     return _tts_with_coqui(text)
 
 

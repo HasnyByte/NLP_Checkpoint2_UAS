@@ -12,12 +12,12 @@ try:
     from .llm import generate_response
     from .stt import transcribe_audio_file
     from .tts import transcribe_text_to_speech
-    from .utils import TEMP_DIR, get_file_ext, normalize_text, safe_delete
+    from .utils import LLM_FALLBACK_RESPONSE, STT_EMPTY_MESSAGE, TEMP_DIR, get_file_ext, normalize_text, safe_delete
 except ImportError:
     from llm import generate_response
     from stt import transcribe_audio_file
     from tts import transcribe_text_to_speech
-    from utils import TEMP_DIR, get_file_ext, normalize_text, safe_delete
+    from utils import LLM_FALLBACK_RESPONSE, STT_EMPTY_MESSAGE, TEMP_DIR, get_file_ext, normalize_text, safe_delete
 
 app = FastAPI(title="Code-Switching Speech-to-Speech API", version="1.0.0")
 
@@ -159,6 +159,31 @@ def _build_json_response(
     return response
 
 
+def _build_json_error_response(
+    message: str,
+    transcript: str = "",
+    normalized_text: str = "",
+    llm_response: str = "",
+    mode: str = "preserve",
+):
+    tags, ratios = _analyze_language(transcript)
+    return JSONResponse(
+        {
+            "status": "error",
+            "message": message,
+            "mode": mode,
+            "user_text": transcript,
+            "transcription": transcript,
+            "normalized_text": normalized_text,
+            "language_tags": tags,
+            "language_ratios": ratios,
+            "llm_response": llm_response,
+            "response_text": llm_response,
+            "audio_base64": "",
+        }
+    )
+
+
 @app.get("/")
 def root():
     return {"message": "Backend aktif. Gunakan endpoint POST /app atau /voice-chat."}
@@ -183,17 +208,58 @@ async def voice_chat(
         with open(upload_path, "wb") as temp_file:
             temp_file.write(file_bytes)
 
-        transcript = transcribe_audio_file(upload_path)
+        transcript = normalize_text(transcribe_audio_file(upload_path))
+        print(f"[Pipeline] STT: {transcript[:160] if transcript else '<kosong>'}")
         if transcript.startswith("[ERROR]"):
-            raise HTTPException(status_code=500, detail=transcript)
+            print(f"[Pipeline] STT gagal: {transcript}")
+            if format == "json":
+                safe_delete(upload_path)
+                return _build_json_error_response("STT gagal. Silakan ulangi rekaman.", mode=mode)
+            raise HTTPException(status_code=502, detail="STT gagal. Silakan ulangi rekaman.")
+
+        if not transcript:
+            print("[Pipeline] STT kosong. Pipeline dihentikan sebelum LLM/TTS.")
+            if format == "json":
+                safe_delete(upload_path)
+                return _build_json_error_response(STT_EMPTY_MESSAGE, mode=mode)
+            raise HTTPException(status_code=422, detail=STT_EMPTY_MESSAGE)
 
         normalized_text = normalize_text(transcript)
-        prompt_text = normalized_text if mode == "normalized" else transcript
-        llm_response = generate_response(prompt_text)
+        prompt_text = normalized_text
+        print(f"[Pipeline] Prompt LLM ({mode}): {prompt_text[:220]}")
+        llm_response = normalize_text(generate_response(prompt_text, mode=mode))
+        print(f"[Pipeline] Respons LLM: {llm_response[:220] if llm_response else '<kosong>'}")
         if llm_response.startswith("[ERROR]"):
-            raise HTTPException(status_code=500, detail=llm_response)
+            print(f"[Pipeline] LLM gagal: {llm_response}")
+            if format == "json":
+                safe_delete(upload_path)
+                return _build_json_error_response(
+                    "LLM gagal memproses respons. Silakan coba lagi.",
+                    transcript=transcript,
+                    normalized_text=normalized_text,
+                    mode=mode,
+                )
+            raise HTTPException(status_code=502, detail="LLM gagal memproses respons. Silakan coba lagi.")
 
-        output_audio_path = transcribe_text_to_speech(llm_response)
+        if not llm_response:
+            print("[Pipeline] Respons LLM kosong. Menggunakan fallback aman.")
+            llm_response = LLM_FALLBACK_RESPONSE
+
+        try:
+            output_audio_path = transcribe_text_to_speech(llm_response)
+        except Exception as exc:
+            print(f"[Pipeline] TTS gagal: {exc}")
+            if format == "json":
+                safe_delete(upload_path)
+                safe_delete(output_audio_path)
+                return _build_json_error_response(
+                    "TTS gagal membuat audio respons. Silakan coba lagi.",
+                    transcript=transcript,
+                    normalized_text=normalized_text,
+                    llm_response=llm_response,
+                    mode=mode,
+                )
+            raise HTTPException(status_code=502, detail="TTS gagal membuat audio respons. Silakan coba lagi.") from exc
         cleanup_task = BackgroundTask(lambda: [safe_delete(upload_path), safe_delete(output_audio_path)])
 
         if format == "json":
@@ -223,6 +289,9 @@ async def voice_chat(
     except Exception as exc:
         safe_delete(upload_path)
         safe_delete(output_audio_path)
+        print(f"[Pipeline] Error tidak terduga: {exc}")
+        if format == "json":
+            return _build_json_error_response("Terjadi kesalahan saat menjalankan pipeline.", mode=mode)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
@@ -234,8 +303,8 @@ async def debug_text(file: UploadFile = File(...)):
     try:
         with open(upload_path, "wb") as temp_file:
             temp_file.write(await file.read())
-        transcript = transcribe_audio_file(upload_path)
-        response = generate_response(transcript) if not transcript.startswith("[ERROR]") else ""
+        transcript = normalize_text(transcribe_audio_file(upload_path))
+        response = generate_response(transcript, mode="preserve") if transcript and not transcript.startswith("[ERROR]") else ""
         return JSONResponse({"transcript": transcript, "response": response})
     finally:
         safe_delete(upload_path)
