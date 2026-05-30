@@ -1,9 +1,14 @@
 import base64
+import json
 import os
+import sys
 import tempfile
+import time
 import uuid
+from pathlib import Path
 
 import gradio as gr
+import pandas as pd
 import requests
 import scipy.io.wavfile
 
@@ -12,6 +17,21 @@ import scipy.io.wavfile
 # Config
 # ---------------------------------------------------------------------------
 BACKEND_URL = os.getenv("FASTAPI_URL", "http://localhost:8000/voice-chat")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+AUDIO_DATA_DIR = PROJECT_ROOT / "data" / "audio"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+BATCH_LIMIT_CHOICES = [10, 50, 100, 250, 500]
+BATCH_TABLE_HEADERS = [
+    "No",
+    "Nama File",
+    "Hasil STT",
+    "Respons LLM",
+    "Status",
+    "Waktu Proses / Latency",
+]
+SUPPORTED_AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".webm"}
 
 
 # ---------------------------------------------------------------------------
@@ -20,7 +40,7 @@ BACKEND_URL = os.getenv("FASTAPI_URL", "http://localhost:8000/voice-chat")
 def status_markup(state="idle", message="Menunggu input suara."):
     state_class = {
         "idle": "idle", "processing": "processing",
-        "success": "success", "error": "error"
+        "success": "success", "warning": "warning", "error": "error"
     }.get(state, "idle")
     return f"""
     <div class="status-box {state_class}">
@@ -72,6 +92,210 @@ def _save_base64_audio(audio_base64, session_id):
     with open(path, "wb") as f:
         f.write(base64.b64decode(audio_base64))
     return path
+
+
+# ---------------------------------------------------------------------------
+# Batch pipeline analysis utilities
+# ---------------------------------------------------------------------------
+def summary_markup(
+    total=0,
+    success=0,
+    failed=0,
+    empty_stt=0,
+    empty_llm=0,
+    avg_latency=0.0,
+    note="Belum ada analisis yang dijalankan.",
+):
+    return f"""
+    <div class="summary-grid">
+        <div class="summary-item"><span>Total Audio</span><b>{total}</b></div>
+        <div class="summary-item success"><span>Sukses</span><b>{success}</b></div>
+        <div class="summary-item danger"><span>Gagal</span><b>{failed}</b></div>
+        <div class="summary-item warning"><span>STT Kosong</span><b>{empty_stt}</b></div>
+        <div class="summary-item warning"><span>LLM Kosong</span><b>{empty_llm}</b></div>
+        <div class="summary-item"><span>Rata-rata Latency</span><b>{avg_latency:.2f} detik</b></div>
+    </div>
+    <div class="summary-note">{note}</div>
+    """
+
+
+def _empty_batch_result(message, state="idle"):
+    return (
+        pd.DataFrame(columns=BATCH_TABLE_HEADERS),
+        status_markup(state, message),
+        summary_markup(note=message),
+    )
+
+
+def _list_audio_files(audio_dir=AUDIO_DATA_DIR):
+    if not audio_dir.exists():
+        return []
+
+    files = [
+        path
+        for path in audio_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS
+    ]
+    return sorted(files, key=lambda path: path.name.lower())
+
+
+def _truncate_text(text, max_chars=260):
+    text = str(text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars].rstrip()}..."
+
+
+def _is_blank_or_error(text):
+    text = str(text or "").strip()
+    return not text or text.startswith("[ERROR]")
+
+
+def _clean_error_message(message):
+    raw_message = str(message or "").strip()
+    if not raw_message:
+        return "Error tidak diketahui"
+
+    if "Teks kosong" in raw_message or "teks kosong" in raw_message:
+        return "TTS gagal - teks kosong"
+
+    if raw_message.startswith("[ERROR]"):
+        raw_message = raw_message.replace("[ERROR]", "", 1).strip()
+
+    try:
+        parsed = json.loads(raw_message)
+        raw_message = str(parsed.get("detail") or parsed.get("message") or raw_message)
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        pass
+
+    lowered = raw_message.lower()
+    if "whisper timeout" in lowered:
+        return "STT timeout"
+    if "whisper" in lowered:
+        return "STT gagal"
+    if "gemini" in lowered or "llm" in lowered:
+        return "LLM gagal"
+    if "timeout" in lowered:
+        return "Request timeout"
+    if "connection" in lowered or "tersambung" in lowered:
+        return "Backend tidak tersambung"
+
+    return _truncate_text(raw_message, 120)
+
+
+def _process_audio_file_for_batch(file_path, mode):
+    start_time = time.time()
+
+    try:
+        from app.llm import generate_response
+        from app.stt import transcribe_audio_file
+        from app.utils import normalize_text
+
+        stt_text = transcribe_audio_file(str(file_path))
+        latency = round(time.time() - start_time, 2)
+
+        if _is_blank_or_error(stt_text):
+            status = (
+                "STT kosong - audio tidak terbaca jelas"
+                if not str(stt_text or "").strip()
+                else _clean_error_message(stt_text)
+            )
+            return "", "", status, latency
+
+        prompt_text = normalize_text(stt_text) if mode == "normalized" else stt_text
+        llm_response = generate_response(prompt_text)
+        latency = round(time.time() - start_time, 2)
+
+        if _is_blank_or_error(llm_response):
+            status = (
+                "Respons LLM kosong"
+                if not str(llm_response or "").strip()
+                else _clean_error_message(llm_response)
+            )
+            return stt_text, "", status, latency
+
+        if "teks kosong" in str(llm_response).lower():
+            return stt_text, "", "TTS gagal - teks kosong", latency
+
+        return stt_text, llm_response, "Sukses", latency
+
+    except requests.exceptions.Timeout:
+        return "", "", "Error: request timeout.", round(time.time() - start_time, 2)
+    except requests.exceptions.ConnectionError:
+        return "", "", "Error: backend FastAPI tidak tersambung.", round(time.time() - start_time, 2)
+    except Exception as exc:
+        return "", "", _clean_error_message(exc), round(time.time() - start_time, 2)
+
+
+def run_batch_pipeline_analysis(limit, mode):
+    if limit is None:
+        return _empty_batch_result(
+            "Pilih jumlah data terlebih dahulu sebelum menjalankan Analisis Pipeline.",
+            "warning",
+        )
+
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        return _empty_batch_result("Jumlah data tidak valid.", "error")
+
+    if limit not in BATCH_LIMIT_CHOICES or limit > 500:
+        return _empty_batch_result("Batas maksimal analisis adalah 500 data.", "error")
+
+    if not AUDIO_DATA_DIR.exists():
+        return _empty_batch_result(
+            f"Folder data/audio tidak ditemukan di: {AUDIO_DATA_DIR}",
+            "error",
+        )
+
+    audio_files = _list_audio_files()
+    if not audio_files:
+        return _empty_batch_result("Folder data/audio kosong atau tidak berisi file audio yang didukung.", "warning")
+
+    selected_files = audio_files[:limit]
+    rows = []
+
+    for index, file_path in enumerate(selected_files, start=1):
+        stt_text, llm_response, status, latency = _process_audio_file_for_batch(file_path, mode)
+        rows.append(
+            {
+                "No": index,
+                "Nama File": _truncate_text(file_path.name, 90),
+                "Hasil STT": _truncate_text(stt_text, 260),
+                "Respons LLM": _truncate_text(llm_response, 260),
+                "Status": _truncate_text(status, 150),
+                "Waktu Proses / Latency": f"{latency:.2f} detik",
+                "_latency": latency,
+            }
+        )
+
+    success_count = sum(1 for row in rows if row["Status"] == "Sukses")
+    failed_count = len(rows) - success_count
+    empty_stt_count = sum(1 for row in rows if "STT kosong" in row["Status"])
+    empty_llm_count = sum(1 for row in rows if "Respons LLM kosong" in row["Status"])
+    avg_latency = sum(row["_latency"] for row in rows) / len(rows) if rows else 0.0
+
+    table_df = pd.DataFrame(rows).drop(columns=["_latency"])
+    summary = (
+        f"Analisis selesai. Diproses {len(rows)} dari {len(audio_files)} file audio. "
+        f"Sukses: {success_count}. Gagal: {failed_count}. "
+        f"STT kosong: {empty_stt_count}. Respons LLM kosong: {empty_llm_count}. "
+        f"Rata-rata latency: {avg_latency:.2f} detik."
+    )
+    state = "success" if failed_count == 0 else "warning"
+    return (
+        table_df,
+        status_markup(state, summary),
+        summary_markup(
+            total=len(rows),
+            success=success_count,
+            failed=failed_count,
+            empty_stt=empty_stt_count,
+            empty_llm=empty_llm_count,
+            avg_latency=avg_latency,
+            note=summary,
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -557,7 +781,7 @@ label span, .svelte-1f354aw { color: var(--muted) !important; }
   align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
-  margin-bottom: 20px;
+  margin-bottom: 16px;
 }
 
 .panel-title {
@@ -599,22 +823,22 @@ label span, .svelte-1f354aw { color: var(--muted) !important; }
 
 /* ── Voice visual card ── */
 .voice-card {
-  padding: 16px;
-  border-radius: 18px;
+  padding: 12px;
+  border-radius: 16px;
   border: 1px solid var(--line);
   background: linear-gradient(180deg, rgba(6,182,212,0.07) 0%, rgba(79,70,229,0.04) 100%);
-  margin-bottom: 16px;
+  margin-bottom: 12px;
 }
 
 .voice-visual {
-  height: 130px;
+  height: 104px;
   display: grid;
   place-items: center;
 }
 
 .mic-disc {
-  width: 88px; height: 88px;
-  border-radius: 26px;
+  width: 72px; height: 72px;
+  border-radius: 22px;
   display: grid;
   place-items: center;
   background: linear-gradient(135deg, #4f46e5, #06b6d4);
@@ -622,12 +846,19 @@ label span, .svelte-1f354aw { color: var(--muted) !important; }
 }
 
 .mic-disc svg {
-  width: 38px; height: 38px;
+  width: 31px; height: 31px;
   fill: none;
   stroke: #fff;
   stroke-width: 1.9;
   stroke-linecap: round;
   stroke-linejoin: round;
+}
+
+.audio-field-label {
+  margin: 0 0 8px 2px;
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 900;
 }
 
 /* ── Audio input/output ── */
@@ -637,6 +868,55 @@ label span, .svelte-1f354aw { color: var(--muted) !important; }
   background: #ffffff !important;
   overflow: hidden !important;
   box-shadow: none !important;
+}
+
+#audio-input {
+  min-height: 174px !important;
+  padding: 10px !important;
+}
+
+#audio-input [role="tablist"] {
+  display: flex !important;
+  justify-content: center !important;
+  gap: 6px !important;
+  padding: 2px 2px 8px !important;
+  margin-bottom: 6px !important;
+  border-bottom: 1px solid var(--line) !important;
+}
+
+#audio-input [role="tabpanel"],
+#audio-input [data-testid="audio"],
+#audio-input [data-testid="file-upload"],
+#audio-input .upload-container,
+#audio-input .dropzone,
+#audio-input .waveform-container {
+  width: 100% !important;
+  min-height: 108px !important;
+  border-radius: 13px !important;
+  background: var(--surface-soft) !important;
+}
+
+#audio-input [data-testid="file-upload"],
+#audio-input .upload-container,
+#audio-input .dropzone {
+  display: grid !important;
+  place-items: center !important;
+  padding: 14px !important;
+  border: 1px dashed rgba(79,70,229,0.28) !important;
+}
+
+#audio-input audio,
+#audio-output audio {
+  width: 100% !important;
+  min-height: 42px !important;
+}
+
+#audio-input .file-preview,
+#audio-input [data-testid="file-preview"] {
+  width: 100% !important;
+  border-radius: 12px !important;
+  padding: 10px 12px !important;
+  background: #ffffff !important;
 }
 
 /* Force all inner wrappers white */
@@ -721,8 +1001,9 @@ label span, .svelte-1f354aw { color: var(--muted) !important; }
 #audio-input .sr-only,
 #audio-input small {
   font-family: "Plus Jakarta Sans", Inter, sans-serif !important;
-  font-size: 12.5px !important;
-  font-weight: 600 !important;
+  font-size: 10.5px !important;
+  font-weight: 700 !important;
+  line-height: 1.35 !important;
   color: var(--muted) !important;
 }
 
@@ -735,11 +1016,11 @@ label span, .svelte-1f354aw { color: var(--muted) !important; }
 
 #audio-input button, #audio-output button,
 #audio-input [role="button"], #audio-output [role="button"] {
-  height: 36px !important;
-  min-height: 36px !important;
+  height: 34px !important;
+  min-height: 34px !important;
   width: auto !important;
-  min-width: 36px !important;
-  padding: 0 12px !important;
+  min-width: 34px !important;
+  padding: 0 11px !important;
   border: 1px solid var(--line) !important;
   border-radius: 10px !important;
   background: #f7f9ff !important;
@@ -752,24 +1033,71 @@ label span, .svelte-1f354aw { color: var(--muted) !important; }
 
 /* Override: tab buttons shouldn't look like regular buttons */
 #audio-input [role="tab"] {
-  height: auto !important;
-  min-height: unset !important;
-  padding: 6px 12px !important;
-  border-radius: 0 !important;
-  background: transparent !important;
-  border: none !important;
-  border-bottom: 2px solid transparent !important;
+  height: 32px !important;
+  min-height: 32px !important;
+  min-width: 108px !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  padding: 0 14px !important;
+  border-radius: 999px !important;
+  background: var(--surface-soft) !important;
+  border: 1px solid var(--line) !important;
+  border-bottom: 1px solid var(--line) !important;
 }
 
 #audio-input [role="tab"][aria-selected="true"] {
-  border-bottom: 2px solid var(--brand) !important;
-  background: transparent !important;
+  border-color: rgba(79,70,229,0.32) !important;
+  background: #edf2ff !important;
 }
 
 #audio-input button:hover, #audio-output button:hover,
 #audio-input [role="button"]:hover, #audio-output [role="button"]:hover {
   background: #edf2ff !important;
   border-color: rgba(79,70,229,0.3) !important;
+}
+
+#audio-input button[aria-label="Drop an audio file here to upload"] {
+  position: relative !important;
+  width: 100% !important;
+  height: 108px !important;
+  min-height: 108px !important;
+  display: flex !important;
+  flex-direction: column !important;
+  align-items: center !important;
+  justify-content: center !important;
+  gap: 6px !important;
+  padding: 14px !important;
+  border: 1px dashed rgba(79,70,229,0.28) !important;
+  border-radius: 14px !important;
+  background: var(--surface-soft) !important;
+  color: var(--text) !important;
+  text-align: center !important;
+  overflow: hidden !important;
+}
+
+#audio-input button[aria-label="Drop an audio file here to upload"] span,
+#audio-input button[aria-label="Drop an audio file here to upload"] p,
+#audio-input button[aria-label="Drop an audio file here to upload"] div {
+  background: transparent !important;
+  color: var(--muted) !important;
+  font-size: 11.5px !important;
+  font-weight: 700 !important;
+  line-height: 1.4 !important;
+}
+
+#audio-input button[aria-label="Drop an audio file here to upload"]:hover {
+  background: #edf2ff !important;
+  border-color: rgba(79,70,229,0.45) !important;
+}
+
+#audio-input input[type="file"] {
+  position: absolute !important;
+  inset: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+  opacity: 0 !important;
+  cursor: pointer !important;
 }
 
 /* Shrink the X (clear) button */
@@ -800,6 +1128,183 @@ label span, .svelte-1f354aw { color: var(--muted) !important; }
   height: 15px !important;
   color: #5b6f8e !important;
   stroke: #5b6f8e !important;
+}
+
+#audio-input [role="tablist"] {
+  border-bottom: 1px solid var(--line) !important;
+}
+
+#audio-input [role="tabpanel"],
+#audio-input [data-testid="audio"],
+#audio-input [data-testid="file-upload"],
+#audio-input .upload-container,
+#audio-input .dropzone,
+#audio-input .waveform-container {
+  background: var(--surface-soft) !important;
+}
+
+#audio-input [data-testid="file-upload"],
+#audio-input .upload-container,
+#audio-input .dropzone {
+  border: 1px dashed rgba(79,70,229,0.28) !important;
+}
+
+/* Compact final pass for Gradio audio internals */
+#audio-input,
+#audio-input .wrap,
+#audio-input [role="tabpanel"],
+#audio-input [data-testid="audio"],
+#audio-input [data-testid="file-upload"],
+#audio-input .upload-container,
+#audio-input .dropzone,
+#audio-input .waveform-container {
+  max-height: 176px !important;
+}
+
+#audio-input [role="tabpanel"],
+#audio-input [data-testid="audio"],
+#audio-input [data-testid="file-upload"],
+#audio-input .upload-container,
+#audio-input .dropzone,
+#audio-input .waveform-container,
+#audio-input button[aria-label="Drop an audio file here to upload"] {
+  min-height: 108px !important;
+  background: var(--surface-soft) !important;
+  border-radius: 13px !important;
+}
+
+#audio-input [aria-label="No microphone found"],
+#audio-input [class*="no-mic"],
+#audio-input [class*="NoMicrophone"],
+#audio-input .no-mic,
+#audio-input .mic-error,
+#audio-input p,
+#audio-input small {
+  font-size: 10.5px !important;
+  line-height: 1.35 !important;
+  font-weight: 700 !important;
+  color: var(--muted) !important;
+  text-align: center !important;
+}
+
+#audio-input button[aria-label="Record audio"],
+#audio-input button[aria-label="Upload file"],
+#audio-input [role="tab"],
+#audio-input button[title*="Record"],
+#audio-input button[title*="Upload"] {
+  height: 32px !important;
+  min-height: 32px !important;
+  min-width: 104px !important;
+  border-radius: 999px !important;
+}
+
+#audio-input button:not([aria-label="Drop an audio file here to upload"]) svg {
+  width: 14px !important;
+  height: 14px !important;
+}
+
+/* Audio input polish: balanced initial and upload states */
+#audio-input {
+  min-height: 154px !important;
+  max-height: 164px !important;
+  padding: 10px 12px !important;
+  border-radius: 16px !important;
+}
+
+#audio-input [role="tablist"] {
+  justify-content: center !important;
+  gap: 10px !important;
+  margin-bottom: 8px !important;
+  padding-bottom: 8px !important;
+}
+
+#audio-input [role="tab"],
+#audio-input button[aria-label="Record audio"],
+#audio-input button[aria-label="Upload file"] {
+  width: 126px !important;
+  min-width: 126px !important;
+  height: 34px !important;
+  min-height: 34px !important;
+  color: #0f172a !important;
+  font-size: 12px !important;
+  font-weight: 900 !important;
+  gap: 7px !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+}
+
+#audio-input [role="tab"] svg,
+#audio-input button[aria-label="Record audio"] svg,
+#audio-input button[aria-label="Upload file"] svg {
+  width: 13px !important;
+  height: 13px !important;
+}
+
+#audio-input button[aria-label="Upload file"]::after {
+  content: "Upload";
+  color: #0f172a;
+  font-size: 11.5px;
+  font-weight: 900;
+}
+
+#audio-input button[aria-label="Record audio"]::after {
+  content: "Mic";
+  color: #0f172a;
+  font-size: 11.5px;
+  font-weight: 900;
+}
+
+#audio-input [role="tabpanel"],
+#audio-input [data-testid="audio"],
+#audio-input [data-testid="file-upload"],
+#audio-input .upload-container,
+#audio-input .dropzone,
+#audio-input .waveform-container,
+#audio-input button[aria-label="Drop an audio file here to upload"] {
+  min-height: 92px !important;
+  max-height: 96px !important;
+  background: var(--surface-soft) !important;
+}
+
+#audio-input button[aria-label="Drop an audio file here to upload"] {
+  height: 92px !important;
+  padding: 10px 14px !important;
+}
+
+#audio-input button[aria-label="Drop an audio file here to upload"] span,
+#audio-input button[aria-label="Drop an audio file here to upload"] p,
+#audio-input button[aria-label="Drop an audio file here to upload"] div {
+  color: #334155 !important;
+  font-size: 11px !important;
+  font-weight: 800 !important;
+}
+
+#audio-input [aria-label="No microphone found"],
+#audio-input [class*="no-mic"],
+#audio-input [class*="NoMicrophone"],
+#audio-input .no-mic,
+#audio-input .mic-error,
+#audio-input p,
+#audio-input small,
+#audio-input option {
+  color: #64748b !important;
+  font-size: 10px !important;
+  font-weight: 700 !important;
+}
+
+#audio-input button[aria-label="Clear"],
+#audio-input button[aria-label="clear"] {
+  opacity: 0.58 !important;
+  transform: scale(0.9) !important;
+  background: #ffffff !important;
+  border-color: #e8eef9 !important;
+}
+
+#audio-input button[aria-label="Clear"]:hover,
+#audio-input button[aria-label="clear"]:hover {
+  opacity: 0.95 !important;
+  background: #f8fbff !important;
 }
 
 /* ── Mode radio ── */
@@ -1019,9 +1524,11 @@ label span, .svelte-1f354aw { color: var(--muted) !important; }
 .status-box.processing .status-dot { background: #14b8a6; }
 .status-box.success    .status-dot { background: #10b981; }
 .status-box.error      .status-dot { background: var(--error); }
+.status-box.warning    .status-dot { background: #f59e0b; }
 
 .status-box.error   .status-msg { color: #b91c1c !important; }
 .status-box.success .status-msg { color: #065f46 !important; }
+.status-box.warning .status-msg { color: #92400e !important; }
 
 /* Status detail textbox */
 #status-detail textarea {
@@ -1033,6 +1540,375 @@ label span, .svelte-1f354aw { color: var(--muted) !important; }
   font-weight: 600 !important;
 }
 #status-detail label span { color: var(--muted) !important; font-size: 12px !important; font-weight: 700 !important; }
+
+/* ── Batch analysis ── */
+.analysis-card {
+  margin-top: 18px;
+}
+
+.analysis-controls {
+  display: flex !important;
+  flex-direction: column !important;
+  gap: 14px !important;
+  width: min(760px, 100%) !important;
+  margin: 0 0 18px !important;
+  padding: 18px 20px !important;
+  border: 1px solid var(--line) !important;
+  border-radius: 20px !important;
+  background: linear-gradient(180deg, #ffffff 0%, #f7f9ff 100%) !important;
+  box-shadow: 0 12px 32px rgba(15,23,80,0.06) !important;
+}
+
+.analysis-control-copy h3 {
+  margin: 0 0 5px;
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 900;
+}
+
+.analysis-control-copy p {
+  margin: 0;
+  max-width: 680px;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.6;
+  font-weight: 700;
+}
+
+.analysis-action-row {
+  display: grid !important;
+  grid-template-columns: minmax(220px, 1fr) minmax(200px, 0.82fr);
+  gap: 14px !important;
+  align-items: end !important;
+  width: 100% !important;
+}
+
+#batch-limit {
+  border: 1px solid var(--line) !important;
+  border-radius: 14px !important;
+  background: #ffffff !important;
+  padding: 0 !important;
+  color: var(--text) !important;
+  box-shadow: none !important;
+  min-height: 46px !important;
+  width: 100% !important;
+}
+
+#batch-limit *,
+#batch-limit label,
+#batch-limit input,
+#batch-limit button,
+#batch-limit [role="combobox"],
+#batch-limit [role="listbox"],
+#batch-limit [role="option"] {
+  background: var(--surface-soft) !important;
+  color: var(--text) !important;
+  border-color: var(--line) !important;
+  font-family: "Plus Jakarta Sans", Inter, sans-serif !important;
+}
+
+#batch-limit input,
+#batch-limit [role="combobox"] {
+  min-height: 38px !important;
+  border-radius: 12px !important;
+  background: #ffffff !important;
+  color: var(--text) !important;
+  font-size: 13px !important;
+  font-weight: 800 !important;
+}
+
+#batch-limit > div,
+#batch-limit .wrap,
+#batch-limit [data-testid="dropdown"] {
+  min-height: 46px !important;
+  border-radius: 14px !important;
+  background: #ffffff !important;
+}
+
+#batch-limit label,
+#batch-limit .label-wrap,
+#batch-limit span {
+  font-size: 12px !important;
+  line-height: 1.35 !important;
+}
+
+#batch-limit p,
+#batch-limit small {
+  color: var(--muted) !important;
+  font-size: 11px !important;
+  line-height: 1.35 !important;
+  margin: 2px 0 8px !important;
+  max-width: 260px !important;
+}
+
+#batch-limit [role="listbox"],
+#batch-limit .options,
+#batch-limit .dropdown-options,
+#batch-limit [class*="options"],
+#batch-limit [class*="Options"] {
+  background: #ffffff !important;
+  border: 1px solid var(--line) !important;
+  border-radius: 14px !important;
+  box-shadow: 0 14px 34px rgba(15,23,80,0.12) !important;
+  overflow: hidden !important;
+}
+
+#batch-limit [role="option"],
+#batch-limit .option,
+#batch-limit [class*="option"],
+#batch-limit [class*="Option"] {
+  background: #ffffff !important;
+  color: var(--text) !important;
+  font-size: 13px !important;
+  font-weight: 800 !important;
+  min-height: 34px !important;
+}
+
+#batch-limit [role="option"]:hover,
+#batch-limit .option:hover,
+#batch-limit [class*="option"]:hover,
+#batch-limit [class*="Option"]:hover {
+  background: #edf2ff !important;
+  color: var(--brand) !important;
+}
+
+/* Gradio mounts dropdown menus outside the component, so keep all popovers light. */
+.gradio-container [role="listbox"],
+.gradio-container [role="menu"],
+body [role="listbox"],
+body [role="menu"],
+body .options,
+body .dropdown-options,
+body [class*="options"],
+body [class*="Options"] {
+  background: #ffffff !important;
+  color: var(--text) !important;
+  border: 1px solid var(--line) !important;
+  border-radius: 14px !important;
+  box-shadow: 0 18px 40px rgba(15,23,80,0.14) !important;
+}
+
+.gradio-container [role="option"],
+body [role="option"],
+body .option,
+body [class*="option"],
+body [class*="Option"] {
+  background: #ffffff !important;
+  color: var(--text) !important;
+  font-size: 13px !important;
+  font-weight: 800 !important;
+}
+
+.gradio-container [role="option"]:hover,
+body [role="option"]:hover,
+body .option:hover,
+body [class*="option"]:hover,
+body [class*="Option"]:hover {
+  background: #edf2ff !important;
+  color: var(--brand) !important;
+}
+
+#analysis-button {
+  height: 46px !important;
+  min-height: 46px !important;
+  width: 100% !important;
+  max-width: 260px !important;
+  padding: 0 18px !important;
+  border-radius: 999px !important;
+  border: 0 !important;
+  background: linear-gradient(135deg, #4f46e5, #06b6d4) !important;
+  color: #ffffff !important;
+  font-size: 13px !important;
+  font-weight: 900 !important;
+  box-shadow: 0 12px 28px rgba(79,70,229,0.22) !important;
+}
+
+#analysis-button:hover {
+  opacity: 0.9 !important;
+  transform: translateY(-1px) !important;
+}
+
+#batch-table {
+  border: 1px solid var(--line) !important;
+  border-radius: 16px !important;
+  overflow: hidden !important;
+  background: #ffffff !important;
+  color: #111827 !important;
+  box-shadow: 0 10px 28px rgba(15,23,80,0.05) !important;
+  min-height: 104px !important;
+  max-height: 420px !important;
+}
+
+#batch-table *,
+#batch-table table,
+#batch-table .table-wrap,
+#batch-table .wrap,
+#batch-table .dataframe,
+#batch-table [class*="table"],
+#batch-table [class*="dataframe"] {
+  font-family: "Plus Jakarta Sans", Inter, sans-serif !important;
+  color: #111827 !important;
+}
+
+#batch-table .table-wrap,
+#batch-table [class*="table-wrap"],
+#batch-table [class*="dataframe"] {
+  background: #ffffff !important;
+}
+
+#batch-table table {
+  width: 100% !important;
+  table-layout: fixed !important;
+  border-collapse: separate !important;
+  border-spacing: 0 !important;
+}
+
+#batch-table th {
+  background: var(--surface-muted) !important;
+  color: var(--text) !important;
+  font-weight: 900 !important;
+  font-size: 12px !important;
+  line-height: 1.35 !important;
+  padding: 11px 12px !important;
+  border-color: var(--line) !important;
+  white-space: normal !important;
+}
+
+#batch-table td {
+  background: #ffffff !important;
+  color: #111827 !important;
+  vertical-align: top !important;
+  white-space: normal !important;
+  overflow-wrap: anywhere !important;
+  word-break: break-word !important;
+  line-height: 1.45 !important;
+  font-size: 12px !important;
+  font-weight: 600 !important;
+  padding: 10px 12px !important;
+  border-color: var(--line) !important;
+  min-height: 44px !important;
+  height: auto !important;
+}
+
+#batch-table tbody tr,
+#batch-table tbody tr:nth-child(odd),
+#batch-table tbody tr:nth-child(even) {
+  background: #ffffff !important;
+  color: #111827 !important;
+  min-height: 44px !important;
+}
+
+#batch-table tbody tr:nth-child(even) td {
+  background: #f9fbff !important;
+}
+
+#batch-table tbody tr:hover td {
+  background: #edf2ff !important;
+}
+
+#batch-table th:nth-child(1),
+#batch-table td:nth-child(1) {
+  width: 64px !important;
+  text-align: center !important;
+}
+
+#batch-table th:nth-child(2),
+#batch-table td:nth-child(2) {
+  width: 190px !important;
+}
+
+#batch-table th:nth-child(5),
+#batch-table td:nth-child(5) {
+  width: 200px !important;
+}
+
+#batch-table th:nth-child(6),
+#batch-table td:nth-child(6) {
+  width: 160px !important;
+  white-space: nowrap !important;
+}
+
+#batch-table [role="gridcell"],
+#batch-table [role="columnheader"],
+#batch-table [class*="cell"],
+#batch-table [class*="Cell"] {
+  background-color: #ffffff !important;
+  color: #111827 !important;
+  white-space: normal !important;
+  overflow-wrap: anywhere !important;
+  line-height: 1.45 !important;
+  min-height: 42px !important;
+}
+
+#batch-table [role="columnheader"] {
+  background-color: var(--surface-muted) !important;
+  font-weight: 900 !important;
+}
+
+#batch-table [class*="dark"],
+#batch-table [style*="rgb(17, 24, 39)"],
+#batch-table [style*="#111827"] {
+  background: #ffffff !important;
+  color: #111827 !important;
+}
+
+#batch-table .empty,
+#batch-table [class*="empty"],
+#batch-table [class*="Empty"] {
+  min-height: 52px !important;
+  background: #ffffff !important;
+  color: var(--muted) !important;
+  font-size: 12px !important;
+  font-weight: 700 !important;
+}
+
+#batch-summary {
+  margin-top: 14px;
+}
+
+.summary-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(120px, 1fr));
+  gap: 10px;
+}
+
+.summary-item {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #ffffff;
+  padding: 12px 13px;
+  box-shadow: 0 6px 18px rgba(15,23,80,0.04);
+}
+
+.summary-item span {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  margin-bottom: 6px;
+}
+
+.summary-item b {
+  color: #111827;
+  font-size: 16px;
+  font-weight: 900;
+}
+
+.summary-item.success b { color: #047857; }
+.summary-item.danger b { color: #b91c1c; }
+.summary-item.warning b { color: #92400e; }
+
+.summary-note {
+  margin-top: 10px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface-soft);
+  color: #111827;
+  font-size: 12.5px;
+  font-weight: 700;
+  line-height: 1.55;
+  padding: 12px 14px;
+}
 
 /* ── Pipeline footer ── */
 .pipeline-footer {
@@ -1047,6 +1923,10 @@ label span, .svelte-1f354aw { color: var(--muted) !important; }
 /* ── Responsive ── */
 @media (max-width: 860px) {
   .layout { grid-template-columns: 1fr !important; }
+  .analysis-controls { width: 100% !important; }
+  .analysis-action-row { grid-template-columns: minmax(0, 1fr) !important; }
+  #analysis-button { width: 100% !important; max-width: none !important; }
+  .summary-grid { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
   .hero-inner { grid-template-columns: 1fr; }
   .hero-visual { display: none; }
   .hero { padding: 32px 24px; }
@@ -1057,6 +1937,7 @@ label span, .svelte-1f354aw { color: var(--muted) !important; }
   .hero { padding: 24px 18px; }
   .hero-title { font-size: 24px; }
   .hero-badges { display: none; }
+  .summary-grid { grid-template-columns: 1fr; }
 }
 """
 
@@ -1155,10 +2036,12 @@ with gr.Blocks(theme=theme, css=css, title="S2S Voice Chatbot") as demo:
                 </div>
                 """)
 
+                gr.HTML('<div class="audio-field-label">Rekam / unggah ujaran Anda</div>')
                 audio_input = gr.Audio(
                     sources=["microphone", "upload"],
                     type="numpy",
                     label="Rekam / unggah ujaran Anda",
+                    show_label=False,
                     elem_id="audio-input",
                 )
 
@@ -1283,6 +2166,71 @@ with gr.Blocks(theme=theme, css=css, title="S2S Voice Chatbot") as demo:
                     elem_id="status-detail",
                 )
 
+        # ── Batch Pipeline Analysis ─────────────────────────────────────────
+        with gr.Column(elem_classes="card analysis-card"):
+            gr.HTML("""
+            <div class="panel-head">
+                <div>
+                    <h2 class="panel-title">Analisis Pipeline</h2>
+                    <p class="panel-copy">
+                        Uji output pipeline untuk audio di folder data/audio dengan batas data terpilih.
+                    </p>
+                </div>
+                <span class="chip">Batch</span>
+            </div>
+            """)
+
+            with gr.Column(elem_classes="analysis-controls"):
+                gr.HTML("""
+                <div class="analysis-control-copy">
+                    <h3>Jumlah Data</h3>
+                    <p>
+                        Pilih jumlah audio yang ingin dianalisis. Maksimal 500 data.
+                        Gunakan pilihan ini untuk membatasi proses batch agar tetap ringan dan mudah dipantau.
+                    </p>
+                </div>
+                """)
+                with gr.Row(elem_classes="analysis-action-row"):
+                    batch_limit = gr.Dropdown(
+                        choices=BATCH_LIMIT_CHOICES,
+                        value=None,
+                        label="Pilih Jumlah Data",
+                        show_label=False,
+                        elem_id="batch-limit",
+                    )
+                    batch_btn = gr.Button(
+                        "Analisis Pipeline",
+                        variant="primary",
+                        elem_id="analysis-button",
+                    )
+
+            batch_status = gr.HTML(
+                status_markup("idle", "Pilih jumlah data, lalu jalankan analisis pipeline.")
+            )
+            batch_table = gr.Dataframe(
+                headers=BATCH_TABLE_HEADERS,
+                value=pd.DataFrame(columns=BATCH_TABLE_HEADERS),
+                datatype=["number", "str", "str", "str", "str", "str"],
+                type="pandas",
+                row_count=(0, "dynamic"),
+                col_count=(6, "fixed"),
+                max_height=520,
+                wrap=True,
+                line_breaks=True,
+                column_widths=["64px", "190px", "28%", "32%", "200px", "160px"],
+                show_search="none",
+                show_row_numbers=False,
+                max_chars=300,
+                interactive=False,
+                label="Hasil Analisis Pipeline",
+                elem_id="batch-table",
+            )
+            batch_summary = gr.HTML(
+                label="Ringkasan Analisis",
+                value=summary_markup(),
+                elem_id="batch-summary",
+            )
+
         # ── Footer ────────────────────────────────────────────────────────────
         gr.HTML("<div class='pipeline-footer'>STT  —  Normalisasi  —  Language Tagging  —  LLM  —  TTS</div>")
 
@@ -1300,6 +2248,12 @@ with gr.Blocks(theme=theme, css=css, title="S2S Voice Chatbot") as demo:
             status_html,
             status_detail,
         ],
+    )
+
+    batch_btn.click(
+        fn=run_batch_pipeline_analysis,
+        inputs=[batch_limit, mode_select],
+        outputs=[batch_table, batch_status, batch_summary],
     )
 
 
